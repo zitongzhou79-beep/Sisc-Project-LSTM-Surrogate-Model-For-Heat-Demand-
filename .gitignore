@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+env/
+
+# Large data files (not tracked — too large for GitHub)
+*.csv
+*.pkl
+*.pt
+*.png
+*.log
+*.json
+
+# OS
+.DS_Store
+Thumbs.db
