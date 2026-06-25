@@ -1,29 +1,3 @@
-"""
-train_tune.py
-=============
-Hyperparameter sensitivity analysis for the Aachen heat demand surrogate.
-
-Trains the same dual-branch LSTM as train_aachen_daily.py with configurable
-hyperparameters supplied via command-line arguments.
-
-Hyperparameter selection rule
-------------------------------
-All decisions (early stopping, model checkpointing) are made using the
-VALIDATION set. The test set is evaluated once at the end and is never
-used for selection.
-
-Usage examples
---------------
-    # baseline
-    python train_tune.py
-
-    # larger model, more training data
-    python train_tune.py --ntrain 1500 --lookback 21 --hidden 96
-
-    # custom seed for reproducibility check
-    python train_tune.py --seed 0
-"""
-
 import argparse
 import numpy as np
 import pandas as pd
@@ -32,7 +6,7 @@ import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 from sklearn.preprocessing import StandardScaler
 
-# ── CLI ───────────────────────────────────────────────────────────────────────
+# CLI
 ap = argparse.ArgumentParser(description="Hyperparameter sweep for heat demand LSTM")
 ap.add_argument("--ntrain",   type=int, default=800,  help="Training buildings")
 ap.add_argument("--nval",     type=int, default=400,  help="Validation buildings")
@@ -43,8 +17,8 @@ ap.add_argument("--epochs",   type=int, default=120,  help="Max training epochs"
 ap.add_argument("--seed",     type=int, default=42,   help="Random seed")
 a = ap.parse_args()
 
-# ── Fixed constants ───────────────────────────────────────────────────────────
-DATA_CSV    = "D:/aachen_dataset_daily.csv"
+# Fixed constants
+DATA_CSV    = "D:/surrogate_project/aachen_dataset_daily.csv"
 WARMUP      = 14
 DROPOUT     = 0.25
 LR          = 1e-3
@@ -57,13 +31,14 @@ STAT_COLS = ["construction_year","net_leased_area","num_floors",
              "floor_height","is_MFH","refurb_level"]
 TARGET    = "daily_heat_per_area"
 
-torch.manual_seed(a.seed);  np.random.seed(a.seed)
+torch.manual_seed(a.seed)
+np.random.seed(a.seed)
 DEV = "cuda" if torch.cuda.is_available() else "cpu"
 print(f"Device {DEV} | ntrain={a.ntrain} lookback={a.lookback} "
       f"hidden={a.hidden} layers={a.layers} seed={a.seed}")
 
 
-# ── Data ──────────────────────────────────────────────────────────────────────
+# Data
 def make_windows(df, lb):
     df = df.sort_values("day").iloc[WARMUP:].reset_index(drop=True)
     if len(df) <= lb:
@@ -74,19 +49,25 @@ def make_windows(df, lb):
     ar = df["net_leased_area"].to_numpy(np.float32)
     Xs, Xt, Y, A = [], [], [], []
     for t in range(lb, len(df)):
-        Xs.append(W[t-lb:t]);  Xt.append(S[t]);  Y.append(y[t]);  A.append(ar[t])
+        Xs.append(W[t-lb:t])
+        Xt.append(S[t])
+        Y.append(y[t])
+        A.append(ar[t])
     return (np.asarray(Xs,np.float32), np.asarray(Xt,np.float32),
             np.asarray(Y,np.float32),  np.asarray(A,np.float32))
 
 
-class DS(Dataset):
+class HeatDemandDataset(Dataset):
     def __init__(self, Xs, Xt, Y):
-        self.Xs=torch.tensor(Xs); self.Xt=torch.tensor(Xt); self.Y=torch.tensor(Y)
+        self.Xs=torch.tensor(Xs)
+        self.Xt=torch.tensor(Xt)
+        self.Y=torch.tensor(Y)
     def __len__(self): return len(self.Y)
-    def __getitem__(self, i): return self.Xs[i], self.Xt[i], self.Y[i]
+    def __getitem__(self, i):
+        return self.Xs[i], self.Xt[i], self.Y[i]
 
 
-# ── Model ─────────────────────────────────────────────────────────────────────
+# Model
 class HeatDemandLSTM(nn.Module):
     def __init__(self, ns, nt, h, l):
         super().__init__()
@@ -99,7 +80,7 @@ class HeatDemandLSTM(nn.Module):
         return self.head(torch.cat([o[:,-1,:], xt], dim=1)).squeeze(-1)
 
 
-# ── Load & split ──────────────────────────────────────────────────────────────
+# Load & split
 raw = pd.read_csv(DATA_CSV)
 ids = np.array(sorted(raw.building_id.unique()))
 rng = np.random.default_rng(a.seed);  rng.shuffle(ids)
@@ -112,7 +93,7 @@ VA  = [b for b in VA if len(by[b]) >= MIN]
 TE  = [b for b in TE if len(by[b]) >= MIN]
 print(f"Split  →  train {len(TR)}  /  val {len(VA)}  /  test {len(TE)}")
 
-# ── Scalers (fit on train only) ───────────────────────────────────────────────
+# Scalers
 trw = [make_windows(by[b], a.lookback) for b in TR]
 trw = [w for w in trw if w]
 ss, st, sy = StandardScaler(), StandardScaler(), StandardScaler()
@@ -139,7 +120,7 @@ Xva, Tva, Yva, _   = scale(VA)
 Xte, Tte, Yte, Ate = scale(TE)
 print(f"Windows  →  train {len(Ytr):,}  /  val {len(Yva):,}  /  test {len(Yte):,}")
 
-# ── Train ─────────────────────────────────────────────────────────────────────
+# Train
 trl = DataLoader(DS(Xtr,Ttr,Ytr), batch_size=BATCH, shuffle=True)
 vl  = DataLoader(DS(Xva,Tva,Yva), batch_size=BATCH)
 m   = HeatDemandLSTM(len(SEQ_COLS), len(STAT_COLS), a.hidden, a.layers).to(DEV)
@@ -152,14 +133,18 @@ for ep in range(1, a.epochs + 1):
     m.train()
     for xs, xt, y in trl:
         xs,xt,y = xs.to(DEV),xt.to(DEV),y.to(DEV)
-        op.zero_grad();  lf(m(xs,xt),y).backward();  op.step()
+        op.zero_grad()
+        lf(m(xs,xt),y).backward()
+        op.step()
 
     m.eval();  v = 0;  n = 0
     with torch.no_grad():
         for xs,xt,y in vl:
             xs,xt,y = xs.to(DEV),xt.to(DEV),y.to(DEV)
-            v += lf(m(xs,xt),y).item()*len(y);  n += len(y)
-    v /= n;  sch.step(v)
+            v += lf(m(xs,xt),y).item()*len(y)
+            n += len(y)
+    v /= n
+    sch.step(v)
 
     marker = ""
     if v < best - 1e-6:
@@ -173,7 +158,7 @@ for ep in range(1, a.epochs + 1):
     if wait >= PATIENCE:
         print("Early stopping.");  break
 
-# ── Test (once, after hyperparameter selection via val) ───────────────────────
+#Test
 m.load_state_dict(bs);  m.eval()
 pr = []
 with torch.no_grad():

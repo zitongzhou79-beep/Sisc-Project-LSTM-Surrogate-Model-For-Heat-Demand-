@@ -1,28 +1,3 @@
-"""
-train_aachen_daily.py
-=====================
-Train a dual-branch LSTM surrogate model for building daily heat demand.
-
-Surrogate I/O (mirrors the physical simulation):
-  INPUT  : full TRY year weather (365 days × 10 features) + building static features (6 values)
-  OUTPUT : full year daily heat demand (365 days, kWh/day)
-
-Internally the model uses a sliding-window approach (LOOKBACK=14 days),
-but the public surrogate interface accepts and returns full annual sequences,
-exactly matching the EDpyFlow / OpenModelica simulation interface.
-
-Weather data note
------------------
-All simulations use the Testreferenzjahr (TRY) for Aachen — a synthetic
-reference climate year published by DWD representing typical local conditions.
-The surrogate therefore naturally takes one full TRY year as weather input.
-
-Hyperparameter selection note
-------------------------------
-Early stopping and model checkpointing are based on validation loss only.
-The test set is evaluated exactly once, after final model selection, to
-avoid any leakage between hyperparameter tuning and test evaluation.
-"""
 
 import os
 import pickle
@@ -36,11 +11,10 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-# ── Paths ─────────────────────────────────────────────────────────────────────
-DATA_CSV = "D:/aachen_dataset_daily.csv"
-OUT_DIR  = "D:/outputs_daily"
+DATA_CSV = "D:/surrogate_project/aachen_dataset_daily.csv"
+OUT_DIR  = "D:/outputs"
 
-# ── Hyperparameters ───────────────────────────────────────────────────────────
+# Hyperparameters
 N_TRAIN, N_VAL, N_TEST = 800, 400, None   # N_TEST=None → use all remaining buildings
 LOOKBACK    = 14    # days of weather history per prediction step
 WARMUP_DAYS = 14    # skip first N days of each building (no full lookback available)
@@ -53,7 +27,7 @@ EPOCHS      = 120
 PATIENCE    = 15    # early stopping patience (based on validation loss)
 SEED        = 42
 
-# ── Feature columns ───────────────────────────────────────────────────────────
+# Feature columns
 SEQ_COLS = [
     "T_out", "sol_global", "sol_diffuse", "sol_direct",
     "rel_hum", "wind_speed", "cloud_opaque", "T_dew",
@@ -65,7 +39,7 @@ STAT_COLS = [
 ]
 TARGET = "daily_heat_per_area"   # W/m²; multiplied by area → kWh/day at inference
 
-# ── Reproducibility ───────────────────────────────────────────────────────────
+# Reproducibility
 torch.manual_seed(SEED)
 np.random.seed(SEED)
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
@@ -73,9 +47,8 @@ os.makedirs(OUT_DIR, exist_ok=True)
 print("Device:", DEVICE)
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
+
 # 1. Data utilities
-# ═══════════════════════════════════════════════════════════════════════════════
 
 def make_windows(df: pd.DataFrame):
     """
@@ -122,9 +95,9 @@ class WindowDataset(Dataset):
         return self.Xs[i], self.Xt[i], self.Y[i]
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
+
 # 2. Model
-# ═══════════════════════════════════════════════════════════════════════════════
+
 
 class HeatDemandLSTM(nn.Module):
     """
@@ -149,10 +122,10 @@ class HeatDemandLSTM(nn.Module):
         return self.head(torch.cat([o[:, -1, :], xt], dim=1)).squeeze(-1)
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
+
 # 3. Surrogate inference interface
 #    Mirrors the physical simulation I/O exactly.
-# ═══════════════════════════════════════════════════════════════════════════════
+
 
 def predict_annual(
     model:   HeatDemandLSTM,
@@ -277,11 +250,11 @@ def predict_annual_batch(
     return results
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# 4. Training
-# ═══════════════════════════════════════════════════════════════════════════════
 
-# ── Load and split data ───────────────────────────────────────────────────────
+# 4. Training
+
+
+# Load and split data
 raw = pd.read_csv(DATA_CSV)
 ids = np.array(sorted(raw.building_id.unique()))
 print(f"{len(ids)} buildings loaded")
@@ -301,7 +274,7 @@ TR  = [b for b in TR if len(by[b]) >= MIN]
 VA  = [b for b in VA if len(by[b]) >= MIN]
 TE  = [b for b in TE if len(by[b]) >= MIN]
 
-# ── Fit scalers on training set only ─────────────────────────────────────────
+# Fit scalers on training set only
 trw = [make_windows(by[b]) for b in TR]
 ss, st, sy = StandardScaler(), StandardScaler(), StandardScaler()
 ss.fit(np.concatenate([w[0].reshape(-1, len(SEQ_COLS)) for w in trw]))
@@ -328,17 +301,17 @@ Xs_va, Xt_va, Y_va, _    = apply_scalers([make_windows(by[b]) for b in VA])
 Xs_te, Xt_te, Y_te, A_te = apply_scalers([make_windows(by[b]) for b in TE])
 print(f"Windows  →  train {len(Y_tr):,}  /  val {len(Y_va):,}  /  test {len(Y_te):,}")
 
-# ── DataLoaders ───────────────────────────────────────────────────────────────
+# DataLoaders
 train_loader = DataLoader(WindowDataset(Xs_tr, Xt_tr, Y_tr), batch_size=BATCH, shuffle=True)
 val_loader   = DataLoader(WindowDataset(Xs_va, Xt_va, Y_va), batch_size=BATCH)
 
-# ── Model, optimiser, scheduler ──────────────────────────────────────────────
+# Model, optimiser, scheduler
 model = HeatDemandLSTM(len(SEQ_COLS), len(STAT_COLS)).to(DEVICE)
 opt   = torch.optim.Adam(model.parameters(), lr=LR, weight_decay=1e-5)
 sch   = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, factor=0.5, patience=5)
 loss_fn = nn.MSELoss()
 
-# ── Training loop (early stopping on validation loss) ─────────────────────────
+# Training loop (early stopping on validation loss)
 best_val_loss = np.inf
 best_state    = None
 wait          = 0
@@ -384,9 +357,7 @@ for ep in range(1, EPOCHS + 1):
 model.load_state_dict(best_state)
 model.eval()
 
-# ═══════════════════════════════════════════════════════════════════════════════
 # 5. Test evaluation  (test set touched exactly once)
-# ═══════════════════════════════════════════════════════════════════════════════
 pr = []
 with torch.no_grad():
     for i in range(0, len(Xs_te), 4096):
@@ -412,14 +383,13 @@ summ = (
 )
 print("\n" + summ)
 
-# ═══════════════════════════════════════════════════════════════════════════════
 # 6. Save artefacts
-# ═══════════════════════════════════════════════════════════════════════════════
+
 torch.save(model.state_dict(), f"{OUT_DIR}/model.pt")
 pickle.dump({"seq": ss, "static": st, "y": sy}, open(f"{OUT_DIR}/scalers.pkl", "wb"))
 open(f"{OUT_DIR}/metrics.txt", "w").write(summ)
 
-# ── Surrogate validation plot for one test building ───────────────────────────
+#  Surrogate validation plot for one test building
 b0  = TE[0]
 df0 = by[b0].sort_values("day")
 
