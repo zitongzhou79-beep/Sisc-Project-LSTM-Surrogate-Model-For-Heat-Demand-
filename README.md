@@ -3,8 +3,6 @@
 LSTM-based surrogate model for predicting annual daily heat demand of residential buildings in Aachen.
 
 
----
-
 ## Project overview
 
 Physical simulations of building heat demand (EDpyFlow + OpenModelica + AixLib + TEASER) are computationally expensive. This project trains a surrogate model that replicates the simulation's input/output interface at a fraction of the cost.
