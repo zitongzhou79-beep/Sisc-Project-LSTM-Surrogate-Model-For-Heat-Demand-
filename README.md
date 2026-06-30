@@ -2,7 +2,6 @@
 
 LSTM-based surrogate model for predicting annual daily heat demand of residential buildings in Aachen.
 
-Developed as part of the course **Continuum Mechanical Modeling for Simulation Science** at RWTH Aachen University.
 
 ---
 
@@ -100,14 +99,4 @@ heat_demand = predict_annual(model, scalers["seq"], scalers["static"], scalers["
 # returns (365,) kWh/day
 ```
 
----
 
-## Requirements
-
-```
-torch
-numpy
-pandas
-scikit-learn
-matplotlib
-```
