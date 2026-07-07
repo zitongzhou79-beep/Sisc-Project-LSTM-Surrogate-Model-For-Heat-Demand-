@@ -10,18 +10,16 @@ from sklearn.preprocessing import StandardScaler
 ap = argparse.ArgumentParser(description="Hyperparameter sweep for heat demand LSTM")
 ap.add_argument("--ntrain",   type=int, default=800,  help="Training buildings")
 ap.add_argument("--nval",     type=int, default=400,  help="Validation buildings")
-ap.add_argument("--lookback", type=int, default=14,   help="Days of weather history before target day")
+ap.add_argument("--lookback", type=int, default=14,   help="Sliding-window length (days)")
 ap.add_argument("--hidden",   type=int, default=64,   help="LSTM hidden size")
 ap.add_argument("--layers",   type=int, default=2,    help="LSTM layers")
 ap.add_argument("--epochs",   type=int, default=120,  help="Max training epochs")
 ap.add_argument("--seed",     type=int, default=42,   help="Random seed")
 a = ap.parse_args()
 
-# window length = past `lookback` days + current day
-SEQ_LEN = a.lookback + 1
-
 # Fixed constants
 DATA_CSV    = "D:/surrogate_project/aachen_dataset_daily.csv"
+WARMUP      = 14
 DROPOUT     = 0.25
 LR          = 1e-3
 BATCH       = 256
@@ -29,15 +27,8 @@ PATIENCE    = 15
 
 SEQ_COLS  = ["T_out","sol_global","sol_diffuse","sol_direct","rel_hum",
              "wind_speed","cloud_opaque","T_dew","doy_sin","doy_cos"]
-
-# static features: numeric (standardised) + one-hot building type (NOT standardised)
-STAT_NUM_COLS = ["construction_year","net_leased_area","num_floors",
-                 "floor_height","refurb_level"]
-BUILDING_TYPES = ["AB", "MFH", "SFH", "TH"]
-TYPE_OHE_COLS  = [f"type_{t}" for t in BUILDING_TYPES]
-STAT_COLS      = STAT_NUM_COLS + TYPE_OHE_COLS
-AREA_IDX       = STAT_COLS.index("net_leased_area")
-
+STAT_COLS = ["construction_year","net_leased_area","num_floors",
+             "floor_height","is_MFH","refurb_level"]
 TARGET    = "daily_heat_per_area"
 
 torch.manual_seed(a.seed)
@@ -48,40 +39,22 @@ print(f"Device {DEV} | ntrain={a.ntrain} lookback={a.lookback} "
 
 
 # Data
-def add_type_onehot(df):
-    df = df.copy()
-    for t, col in zip(BUILDING_TYPES, TYPE_OHE_COLS):
-        df[col] = (df["building_type"] == t).astype(np.float32)
-    return df
-
-
 def make_windows(df, lb):
-    # circular padding → no warm-up dropped; every day predictable; window includes current day
-    df = df.sort_values("day").reset_index(drop=True)
+    df = df.sort_values("day").iloc[WARMUP:].reset_index(drop=True)
     if len(df) <= lb:
         return None
-    seq_len = lb + 1
     W = df[SEQ_COLS].to_numpy(np.float32)
     S = df[STAT_COLS].to_numpy(np.float32)
     y = df[TARGET].to_numpy(np.float32)
     ar = df["net_leased_area"].to_numpy(np.float32)
-    W_pad = np.concatenate([W[-lb:], W], axis=0)
     Xs, Xt, Y, A = [], [], [], []
-    for t in range(len(df)):
-        Xs.append(W_pad[t:t+seq_len])
+    for t in range(lb, len(df)):
+        Xs.append(W[t-lb:t])
         Xt.append(S[t])
         Y.append(y[t])
         A.append(ar[t])
     return (np.asarray(Xs,np.float32), np.asarray(Xt,np.float32),
             np.asarray(Y,np.float32),  np.asarray(A,np.float32))
-
-
-def scale_static(st, Xt):
-    Xt = np.asarray(Xt, np.float32)
-    n_num = len(STAT_NUM_COLS)
-    num = st.transform(Xt[:, :n_num]).astype(np.float32)
-    ohe = Xt[:, n_num:]
-    return np.concatenate([num, ohe], axis=1).astype(np.float32)
 
 
 class HeatDemandDataset(Dataset):
@@ -109,13 +82,12 @@ class HeatDemandLSTM(nn.Module):
 
 # Load & split
 raw = pd.read_csv(DATA_CSV)
-raw = add_type_onehot(raw)
 ids = np.array(sorted(raw.building_id.unique()))
 rng = np.random.default_rng(a.seed);  rng.shuffle(ids)
 TR  = list(ids[:a.ntrain]);  rest = list(ids[a.ntrain:]);  rng.shuffle(rest)
 VA  = list(rest[:a.nval]);   TE   = list(rest[a.nval:])
 by  = {b: g for b, g in raw.groupby("building_id")}
-MIN = a.lookback + 1
+MIN = WARMUP + a.lookback + 1
 TR  = [b for b in TR if len(by[b]) >= MIN]
 VA  = [b for b in VA if len(by[b]) >= MIN]
 TE  = [b for b in TE if len(by[b]) >= MIN]
@@ -123,28 +95,28 @@ print(f"Split  →  train {len(TR)}  /  val {len(VA)}  /  test {len(TE)}")
 
 # Scalers
 trw = [make_windows(by[b], a.lookback) for b in TR]
-trw = [w for w in trw if w is not None]
+trw = [w for w in trw if w]
 ss, st, sy = StandardScaler(), StandardScaler(), StandardScaler()
 ss.fit(np.concatenate([w[0].reshape(-1, len(SEQ_COLS)) for w in trw]))
-st.fit(np.concatenate([w[1][:, :len(STAT_NUM_COLS)] for w in trw]))   # numeric block only
+st.fit(np.concatenate([w[1] for w in trw]))
 sy.fit(np.concatenate([w[2] for w in trw]).reshape(-1, 1))
 
 def scale(bids):
     Xs, Xt, Y, A = [], [], [], []
     for b in bids:
         w = make_windows(by[b], a.lookback)
-        if w is None or len(w[2]) == 0: continue
+        if not w or len(w[2]) == 0: continue
         xs, xt, y, ar = w
         n, L, F = xs.shape
         Xs.append(ss.transform(xs.reshape(-1,F)).reshape(n,L,F))
-        Xt.append(scale_static(st, xt))
+        Xt.append(st.transform(xt))
         Y.append(sy.transform(y.reshape(-1,1)).ravel())
         A.append(ar)
     return (np.concatenate(Xs).astype(np.float32), np.concatenate(Xt).astype(np.float32),
             np.concatenate(Y).astype(np.float32),  np.concatenate(A).astype(np.float32))
 
 Xtr, Ttr, Ytr, _   = scale(TR)
-Xva, Tva, Yva, _   = scale(VA)
+Xva, Tva, Yva, Ava = scale(VA)
 Xte, Tte, Yte, Ate = scale(TE)
 print(f"Windows  →  train {len(Ytr):,}  /  val {len(Yva):,}  /  test {len(Yte):,}")
 
@@ -186,16 +158,16 @@ for ep in range(1, a.epochs + 1):
     if wait >= PATIENCE:
         print("Early stopping.");  break
 
-#Test
+# Hyperparameter selection is based on the VALIDATION set (test set is never touched here)
 m.load_state_dict(bs);  m.eval()
 pr = []
 with torch.no_grad():
-    for i in range(0, len(Xte), 4096):
-        pr.append(m(torch.tensor(Xte[i:i+4096]).to(DEV),
-                    torch.tensor(Tte[i:i+4096]).to(DEV)).cpu().numpy())
+    for i in range(0, len(Xva), 4096):
+        pr.append(m(torch.tensor(Xva[i:i+4096]).to(DEV),
+                    torch.tensor(Tva[i:i+4096]).to(DEV)).cpu().numpy())
 pr   = np.concatenate(pr)
-pred = np.clip(sy.inverse_transform(pr.reshape(-1,1)).ravel(), 0, None) * Ate
-true = sy.inverse_transform(Yte.reshape(-1,1)).ravel() * Ate
+pred = np.clip(sy.inverse_transform(pr.reshape(-1,1)).ravel(), 0, None) * Ava
+true = sy.inverse_transform(Yva.reshape(-1,1)).ravel() * Ava
 
 rmse = np.sqrt(np.mean((pred-true)**2))
 cv   = 100 * rmse / true.mean()
@@ -203,5 +175,5 @@ nmbe = 100 * (pred-true).mean() / true.mean()
 
 print(f"\n>>> ntrain={a.ntrain} lookback={a.lookback} hidden={a.hidden} "
       f"seed={a.seed}")
-print(f"    CV(RMSE)={cv:.2f}%   NMBE={nmbe:+.2f}%   RMSE={rmse:.2f} kWh/day")
-print(f"    test: {len(TE)} buildings, {len(Yte):,} days")
+print(f"    [VALIDATION]  CV(RMSE)={cv:.2f}%   NMBE={nmbe:+.2f}%   RMSE={rmse:.2f} kWh/day")
+print(f"    val: {len(VA)} buildings, {len(Yva):,} days")
